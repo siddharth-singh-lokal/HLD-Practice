@@ -1,173 +1,117 @@
-# URL Shortener — System Design Learnings
+# URL Shortener — Design Notes
 
-Problem Statement: https://thedesignround.com/system-design/problems/01-url-shortener
+## Problem statement
 
-Main takeaway: start simple, do the capacity math, identify the bottleneck, then scale the design only where needed.
+> Design a URL shortening service like bit.ly. A user gives you a long URL, you
+> return a short code; when someone hits the short URL they get redirected to the
+> long one.
 
-### Core design
+**Requirements (clarified up front):**
 
-```text
-Client
-  ↓
-LB / API Gateway
-  ↓
-URL Service
-  ↓
-Redis
-  ↓
-Cassandra
+- Scale: **100M new URLs/day**, read:write ≈ **100:1**, redirect p99 < 100ms
+- URLs never expire
+- Out of scope: auth, real DNS, multi-region, analytics (until follow-up)
+
+## Solution overview
+
+### 1. Capacity math
+
+```
+100M new URLs/day ÷ 100k s  ≈ 1,000 write QPS   (peak ~3k)  → 1 Postgres, easy
+× 100 B/row                 = 10^10 B = 10 GB/day ≈ 4 TB/yr → no sharding
+reads 100:1                 = ~100k read QPS                  → THE problem → Redis
 ```
 
-- Very read-heavy system → optimize the redirect path first.
-- Redis for fast/hot reads, Cassandra for durable scalable storage.
-- Keep the service stateless so it can scale horizontally.
+Reference anchors: 1M/day ≈ 12 QPS. bytes ÷ 10⁹ = GB, ÷ 10¹² = TB.
+Per box: Postgres ~1-10k writes/s, ~10-50k reads/s. Redis ~100k-1M ops/s.
+Cache at 90% hit → DB only sees ~10k reads/s.
 
-### Back-of-the-envelope
+### 2. API
 
-~100M URLs/month, ~100:1 read/write.
-
-→ ~38 writes/sec
-→ ~3.8K reads/sec average
-→ ~19K reads/sec peak
-
-7-char Base62:
-
-`62^7 ≈ 3.5T`
-
-So 7 chars gives plenty of room.
-
-### ID generation
-
-**Hash**
-
-- Deterministic
-- Collision handling needed
-
-**Counter**
-
-- Simple + unique
-- Central bottleneck / predictable IDs
-
-**KGS**
-
-- Pre-generate IDs in batches
-- No collision check on every request
-- Good for short + unique IDs
-- Some unused IDs can be lost if a server dies
-
-Main thing to remember: **hash if deterministic mapping matters, KGS if I mainly need short + unique IDs at scale.**
-
-### Read path
-
-```text
-GET /abc123
-     ↓
-Redis
-  hit → redirect
-  miss → Cassandra → Redis → redirect
+```
+POST /api/v1/urls      { longUrl, customAlias? } → 201 { code, shortUrl }
+GET  /{code}           → 301 | 302 Location: longUrl
+GET  /api/v1/urls/{code}/stats  (off critical path)
 ```
 
-Cache-aside.
+### 3. Data model
 
-Things to think about:
-
-- Hot keys / viral URLs
-- Cache stampede
-- Redis failure → Cassandra fallback
-
-### 301 vs 302
-
-**301**
-
-- More caching
-- Less load
-- Analytics can become less accurate
-
-**302**
-
-- Request keeps coming back to us
-- Better analytics / more control
-- More load
-
-→ Use **302 when click tracking matters**.
-
-### Analytics
-
-Keep it off the critical path:
-
-```text
-Redirect → Kafka → Flink → ClickHouse
+```
+urls: id BIGINT PK, code VARCHAR(7) UNIQUE, long_url TEXT, created_at, clicks BIGINT
+index on code — that's the lookup key. One table.
 ```
 
-- Kafka decouples/buffers events
-- Flink processes/aggregates
-- ClickHouse for analytics queries
+### 4. High-level architecture
 
-**Analytics can be eventually consistent. Redirects cannot.**
-
-### Custom aliases
-
-Two users might request the same alias at the same time.
-
-Bloom filter can optimize the lookup, but correctness should come from an atomic DB operation like:
-
-`INSERT IF NOT EXISTS`
-
-### Scaling
-
-Start with:
-
-```text
-LB → URL Service → Redis → DB
+```
+Client → DNS → L7 LB (TLS term) → App servers (stateless, horizontal)
+                          ├─ Redis (ElastiCache): code → longUrl   ← read path
+                          └─ Aurora Postgres: urls table          ← source of truth
 ```
 
-Then add things only when needed:
+- **Read path:** cache hit → redirect. Miss → DB → write back (cache-aside) → redirect.
+- **Write path:** generate code → insert → respond. No cache write (read path self-populates).
 
-- KGS for ID generation
-- Cassandra for larger scale
-- Kafka/Flink/ClickHouse for analytics
-- Multi-DC + global routing for global scale
-- CDN/L1 cache for very hot redirects
+### 5. Deep dive: code generation — counter + base62
 
-### Failure cases
+- **Counter → base62:** unique by construction, zero collision logic. `62^7 ≈ 3.5T` vs
+  `100M × 365 × 10yr ≈ 365B` needed → **~9.6× headroom**, proven by math.
+- **KGS** (pre-generate ID batches): no per-request uniqueness check; some IDs lost if a
+  server dies. Reach for it at higher write scale.
+- **Hash(longUrl) → 7 chars:** dedup becomes a "feature", but collision handling +
+  check-on-insert is ugly. Avoid as the primary approach.
 
-- Redis down → DB fallback
-- Kafka/Flink down → analytics delayed, redirects still work
-- KGS down → use already allocated IDs until replenished
-- DC down → fail over to another region
+### 6. Deep dive: cache read path + 301 vs 302
 
-### Other stuff worth remembering
+- **Cache stampede / hot key:** single-flight per key (one refresh, rest wait or serve stale).
+- **301 vs 302:** 301 = permanent, browsers cache it → less load, worse click tracking.
+  302 = every request hits us → better analytics, more load. **302 when click tracking matters.**
 
-- Rate limiting + malicious URL checks
-- URL expiry / TTL
-- URL normalization / dedup
-- Multi-region replication
-- Monitor redirect latency, cache hit rate, error rate, Kafka lag, KGS pool
+### 7. DB choice — Postgres (Aurora) over Cassandra/Scylla
 
-### Complete flow
+The cache eats the reads, so the DB only sees ~1k writes/s + ~10k misses/s — a
+**single-node ACID shape**, not a distributed-DB shape.
 
-```text
-Requirements
-    ↓
-Back-of-envelope
-    ↓
-Simple architecture
-    ↓
-Read path + cache
-    ↓
-ID generation
-    ↓
-301 vs 302
-    ↓
-Analytics
-    ↓
-Hot keys / failures
-    ↓
-Multi-region if needed
-```
+- Cassandra/Scylla shine at: write-heavy, wide rows, multi-master, no joins. **Reads are
+  their weak side.** This workload is 100:1 read:write → wrong tool.
+- Scylla is right when: 10M+ writes/s of time-series/wide-row data (e.g. click analytics at scale).
 
-**Big takeaway:** don't memorize the final architecture.
+**Why no sharding:** 4 TB/yr fits one box; 1k writes/s is a tenth of one box; reads are
+handled by cache. Shard only when: writes > ~10k/s sustained, storage > one box,
+**working set won't fit RAM** (read amplification), or multi-region writes. It's driven by
+storage growth + read amplification, NOT write QPS.
 
-Remember the progression:
+### 8. Sizing (AWS)
 
-**read-heavy → cache → scalable DB → ID generation → async analytics → handle hot keys/failures → multi-region**
+| Box | Size | Why |
+| --- | --- | --- |
+| Aurora Postgres writer | 2 vCPU / 16 GB | 1k writes/s ≈ 10-15% CPU; 10k misses/s ≈ 40-50% util peak |
+| Aurora Postgres reader | 2 vCPU / 16 GB, idle | HA/failover only, NOT load |
+| ElastiCache Redis | 1 node, 16 GB | top ~100M hot codes × 100 B ≈ 10 GB working set |
+
+The cost argument: the cache is the *frugal* option, not an extra. Without it you need
+3-4 Postgres replicas — each a full ~4 TB copy — instead of one 16 GB Redis node. And
+caching is cheap *for this data*: a URL mapping is insert-only + near-immutable, so slight
+staleness is harmless and there's nothing to invalidate. (Cache coherence only bites for
+mutable, correctness-critical data — inventory, wallet — not here.)
+Buy for the numbers; scale when a metric crosses ~60% sustained.
+
+### 9. Failures
+
+- **Redis down:** DB serves reads directly — degraded, latency may exceed budget, but up.
+- **DB down:** cached codes still redirect; uncached codes fail → fail fast, don't queue.
+- **Custom alias race:** two users, same alias → atomic `INSERT ... ON CONFLICT DO NOTHING`;
+  loser gets 0 rows → returns a different alias.
+
+### 10. Scale path (10x)
+
+Shard `urls` by code — hash/consistent-hashing (min rebalance on node add) or range.
+More Redis nodes + replication; multi-region read replicas near users. Analytics stays off
+the critical path: `redirect → Kafka → Flink → ClickHouse`. **Analytics can be eventually
+consistent. Redirects cannot.**
+
+## Summary
+
+> Read-heavy, cache-first, counter → base62, Aurora Postgres as source of truth,
+> cache-aside read path, 302, analytics async. Start simple; scale only the part
+> the numbers say breaks.
